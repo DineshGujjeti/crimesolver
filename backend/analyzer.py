@@ -3,6 +3,9 @@ from PIL import Image, ExifTags
 from torchvision import transforms, models
 import torch.nn as nn
 from ultralytics import YOLO
+from ultralytics.nn.tasks import DetectionModel
+
+torch.serialization.add_safe_globals([DetectionModel])
 
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "../models")
 
