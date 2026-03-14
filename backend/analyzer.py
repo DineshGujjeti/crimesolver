@@ -68,7 +68,7 @@ class CrimeAnalyzer:
             if os.path.exists(cp):
                 m = models.efficientnet_b0()
                 m.classifier[1] = nn.Linear(m.classifier[1].in_features, len(CRIME_CLASSES))
-                ckpt = torch.load(cp, map_location=self.device)
+                ckpt = torch.load(cp, map_location=self.device, weights_only=False)
                 m.load_state_dict(ckpt["model_state_dict"])
                 self.classifier = m.to(self.device).eval()
                 print("✅ Classifier loaded")
