@@ -6,7 +6,6 @@ from ultralytics import YOLO
 from ultralytics.nn.tasks import DetectionModel
 
 torch.serialization.add_safe_globals([DetectionModel])
-
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "../models")
 
 def _load_class_names():
