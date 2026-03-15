@@ -1,11 +1,21 @@
-import cv2, torch, numpy as np, io, os, hashlib, json
-from PIL import Image, ExifTags
+
+import cv2
+import torch
+import numpy as np
+import io
+import os
+import hashlib
+import json
+import uuid
+
+from PIL import Image
 from torchvision import transforms, models
 import torch.nn as nn
 from ultralytics import YOLO
 from ultralytics.nn.tasks import DetectionModel
 
 torch.serialization.add_safe_globals([DetectionModel])
+
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "../models")
 
 def _load_class_names():
@@ -13,520 +23,440 @@ def _load_class_names():
     if os.path.exists(p):
         with open(p) as f:
             return json.load(f)
-    return {"classifier": ["normal","violence"]}
+    return {"classifier": ["normal", "violence"]}
 
-CRIME_CLASSES     = _load_class_names().get("classifier", ["normal","violence"])
-DANGEROUS_OBJECTS = {"gun","pistol","rifle","weapon","knife","blood","fire"}
+CRIME_CLASSES = _load_class_names().get("classifier", ["normal", "violence"])
 
-COCO_MAP = {
-    0:"person", 1:"bicycle", 2:"car", 3:"motorcycle", 5:"bus", 7:"truck",
-    14:"bird", 15:"cat", 16:"dog", 24:"backpack", 25:"umbrella",
-    26:"handbag", 28:"suitcase", 39:"bottle", 41:"cup",
-    43:"knife", 44:"spoon", 45:"bowl", 56:"chair", 57:"couch",
-    60:"table", 62:"tv", 63:"laptop", 67:"cell phone",
-    73:"book", 76:"scissors", 77:"teddy bear",
-}
-COCO_REMAP = {"scissors":"knife", "knife":"knife"}
-
-COLORS = {
-    "gun":(0,0,255),"pistol":(0,0,255),"rifle":(0,0,200),"weapon":(0,0,180),
-    "knife":(0,80,255),"blood":(60,0,180),"fire":(0,120,255),
-    "person":(0,210,80),"car":(220,180,0),"motorcycle":(200,140,0),
-    "bicycle":(180,120,0),"truck":(160,100,0),"bus":(140,80,0),
-    "bottle":(140,200,100),"backpack":(100,180,200),"cell phone":(180,100,220),
-}
-DEF_COLOR = (160,160,160)
+DANGEROUS_OBJECTS = {"gun", "knife", "weapon", "blood", "fire"}
 
 VAL_TF = transforms.Compose([
     transforms.Resize((224,224)),
     transforms.ToTensor(),
-    transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+    transforms.Normalize([0.485,0.456,0.406],
+                         [0.229,0.224,0.225])
 ])
 
 class CrimeAnalyzer:
 
     def __init__(self):
-        self.device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+
+        self.yolo_coco = None
         self.yolo_custom = None
-        self.yolo_coco   = None
-        self.classifier  = None
-        self.models_ready= False
-        self._load()
+        self.classifier = None
 
-    def _load(self):
+        self.models_ready = False
+
+        self._load_models()
+
+        self.models_ready = True
+
+    def _load_models(self):
+
         try:
-            p = os.path.join(MODELS_DIR, "best.pt")
-            if os.path.exists(p):
-                self.yolo_custom = YOLO(p)
-                print(f"✅ Custom YOLO loaded from {p}")
-            else:
-                print(f"⚠️ best.pt not found at {p}")
 
-            print("⬇️ Loading YOLOv8s pretrained (COCO)...")
+            print("Loading YOLOv8 COCO model...")
             self.yolo_coco = YOLO("yolov8s.pt")
-            print("✅ YOLOv8s COCO ready")
 
-            cp = os.path.join(MODELS_DIR, "crime_classifier_best.pt")
-            if os.path.exists(cp):
-                m = models.efficientnet_b0()
-                m.classifier[1] = nn.Linear(m.classifier[1].in_features, len(CRIME_CLASSES))
-                ckpt = torch.load(cp, map_location=self.device, weights_only=False)
-                m.load_state_dict(ckpt["model_state_dict"])
-                self.classifier = m.to(self.device).eval()
-                print("✅ Classifier loaded")
-            else:
-                print(f"⚠️ Classifier not found at {cp}")
+            custom_path = os.path.join(MODELS_DIR, "best.pt")
 
-            self.models_ready = True
+            if os.path.exists(custom_path):
+                print("Loading custom weapon model...")
+                self.yolo_custom = YOLO(custom_path)
+
+            classifier_path = os.path.join(
+                MODELS_DIR,
+                "crime_classifier_best.pt"
+            )
+
+            if os.path.exists(classifier_path):
+
+                print("Loading scene classifier...")
+
+                model = models.efficientnet_b0()
+
+                model.classifier[1] = nn.Linear(
+                    model.classifier[1].in_features,
+                    len(CRIME_CLASSES)
+                )
+
+                checkpoint = torch.load(
+                    classifier_path,
+                    map_location=self.device
+                    weights_only=False
+                )
+
+                state = checkpoint["model_state_dict"] \
+                    if isinstance(checkpoint, dict) else checkpoint
+
+                model.load_state_dict(state)
+
+                self.classifier = model.to(self.device).eval()
+
         except Exception as e:
-            print(f"❌ Model loading error: {e}")
-            self.models_ready = False
 
-    def validate_image(self, img_bytes: bytes, filename: str) -> dict:
-        issues, warnings = [], []
+            print("Model loading error:", e)
 
-        if not any(img_bytes[:len(s)]==s for s in
-                   [b"\xff\xd8\xff",b"\x89PNG",b"GIF8",b"RIFF",b"BM"]):
-            issues.append("File signature mismatch")
+    def validate_image(self, img_bytes, filename):
+
+        issues = []
+        warnings = []
 
         try:
+
             pil = Image.open(io.BytesIO(img_bytes))
-            pil.verify()
-            pil = Image.open(io.BytesIO(img_bytes))
-            w, h = pil.size
-            mode = pil.mode
+
+            width, height = pil.size
+
         except Exception as e:
-            return {"is_valid":False,"is_authentic":False,
-                    "ela_score":0,"issues":[str(e)],"warnings":[],"metadata":{},"image_info":{}}
 
-        ela = self._ela(pil)
-        auth = ela < 15.0
-        meta = self._exif(pil, filename, img_bytes)
+            return {
+                "is_valid": False,
+                "is_authentic": False,
+                "ela_score": 0,
+                "issues": [str(e)],
+                "warnings": [],
+                "metadata": {},
+                "image_info": {}
+            }
 
-        if not auth:
-            warnings.append(f"Possible manipulation (ELA {ela:.1f})")
+        ela_score = self._calculate_ela(pil)
 
-        if w < 32 or h < 32:
-            issues.append("Resolution too low")
+        authentic = ela_score < 15
+
+        if not authentic:
+            warnings.append("Possible manipulation detected")
 
         return {
-            "is_valid":len(issues)==0,
-            "is_authentic":auth,
-            "ela_score":round(ela,2),
-            "ela_threshold":15.0,
-            "issues":issues,
-            "warnings":warnings,
-            "metadata":meta,
-            "image_info":{
-                "width":w,
-                "height":h,
-                "mode":mode,
-                "file_size":f"{len(img_bytes)/1024:.1f} KB",
+
+            "is_valid": True,
+            "is_authentic": authentic,
+            "ela_score": round(ela_score, 2),
+            "ela_threshold": 15.0,
+            "issues": issues,
+            "warnings": warnings,
+            "metadata": {
+                "filename": filename
+            },
+            "image_info": {
+                "width": width,
+                "height": height,
                 "md5_hash": hashlib.md5(img_bytes).hexdigest()
             }
         }
 
-    def _ela(self, pil, quality=90):
+    def _calculate_ela(self, pil, quality=90):
+
         try:
-            buf = io.BytesIO()
+
+            buffer = io.BytesIO()
+
             rgb = pil.convert("RGB")
-            rgb.save(buf,"JPEG",quality=quality)
-            buf.seek(0)
-            comp = Image.open(buf).convert("RGB")
 
-            diff = np.abs(np.array(rgb,dtype=np.float32) - np.array(comp,dtype=np.float32)).flatten()
-            diff.sort()
+            rgb.save(buffer, "JPEG", quality=quality)
 
-            return float(np.mean(diff[int(len(diff)*0.9):]))
+            buffer.seek(0)
+
+            recompressed = Image.open(buffer)
+
+            diff = np.abs(
+                np.array(rgb, dtype=np.float32)
+                - np.array(recompressed, dtype=np.float32)
+            )
+
+            return float(np.mean(diff))
+
         except:
-            return 0.0
+            return 0
 
-    def _exif(self, pil, filename, img_bytes):
-        meta = {"filename":filename,"file_size":f"{len(img_bytes)/1024:.1f} KB","format":pil.format}
+    def _detect_objects(self, image_path):
+
+        detections = []
 
         try:
-            ex = pil._getexif()
-            if ex:
-                for tid,val in ex.items():
-                    tag = ExifTags.TAGS.get(tid,tid)
-                    if tag in ["DateTime","Make","Model","Software","DateTimeOriginal"]:
-                        meta[tag] = str(val)
-        except:
-            pass
 
-        return meta
+            if self.yolo_coco:
 
-    def analyze(self, img_path:str, img_bytes:bytes, filename:str) -> dict:
+                results = self.yolo_coco(image_path, conf=0.25)[0]
 
-        validation  = self.validate_image(img_bytes, filename)
-        pil         = Image.open(img_path).convert("RGB")
+                for box in results.boxes:
 
-        detections  = self._detect(img_path)
-        cls_result  = self._classify(pil)
+                    cls_id = int(box.cls[0])
 
-        description = self._describe(cls_result, detections)
-        threat      = self._threat(cls_result, detections)
+                    confidence = float(box.conf[0])
 
-        ann_path    = self._annotate(img_path, detections)
+                    label = self.yolo_coco.names[cls_id]
 
-        return {
-            "validation":validation,
-            "classification":cls_result,
-            "detections":detections,
-            "description":description,
-            "threat_level":threat,
-            "annotated_image":ann_path,
-            "total_objects":len(detections),
-            "dangerous_objects":[d for d in detections if d["object"] in DANGEROUS_OBJECTS]
-        }
-
-    def _detect(self, img_path:str) -> list:
-
-        dets, boxes = [], []
-
-        if self.yolo_coco:
-            try:
-                res = self.yolo_coco(img_path, conf=0.25, iou=0.45, verbose=False)[0]
-
-                for box in res.boxes:
-
-                    cid  = int(box.cls[0])
-                    conf = float(box.conf[0])
                     xyxy = box.xyxy[0].tolist()
 
-                    if cid not in COCO_MAP:
-                        continue
+                    detections.append({
 
-                    raw  = COCO_MAP[cid]
-                    name = COCO_REMAP.get(raw, raw)
+                        "object": label,
 
-                    dets.append({
-                        "object":name,
-                        "raw_label":raw,
-                        "confidence":round(conf,3),
-                        "source":"coco",
-                        "box":{
-                            "x1":int(xyxy[0]),
-                            "y1":int(xyxy[1]),
-                            "x2":int(xyxy[2]),
-                            "y2":int(xyxy[3])
+                        "confidence": round(confidence, 3),
+
+                        "box": {
+                            "x1": int(xyxy[0]),
+                            "y1": int(xyxy[1]),
+                            "x2": int(xyxy[2]),
+                            "y2": int(xyxy[3])
                         },
-                        "is_dangerous":name in DANGEROUS_OBJECTS
+
+                        "is_dangerous": label in DANGEROUS_OBJECTS
                     })
 
-                    boxes.append(xyxy)
+            if self.yolo_custom:
 
-            except Exception as e:
-                print(f"COCO error: {e}")
+                results = self.yolo_custom(image_path, conf=0.4)[0]
 
-        if self.yolo_custom:
-            try:
-                res = self.yolo_custom(img_path, conf=0.50, iou=0.45, verbose=False)[0]
+                for box in results.boxes:
 
-                for box in res.boxes:
+                    confidence = float(box.conf[0])
 
-                    conf = float(box.conf[0])
                     xyxy = box.xyxy[0].tolist()
 
-                    if self._overlap(xyxy, boxes, 0.3):
-                        continue
+                    detections.append({
 
-                    dets.append({
-                        "object":"gun",
-                        "raw_label":"gun",
-                        "confidence":round(conf,3),
-                        "source":"custom",
-                        "box":{
-                            "x1":int(xyxy[0]),
-                            "y1":int(xyxy[1]),
-                            "x2":int(xyxy[2]),
-                            "y2":int(xyxy[3])
+                        "object": "gun",
+
+                        "confidence": round(confidence, 3),
+
+                        "box": {
+                            "x1": int(xyxy[0]),
+                            "y1": int(xyxy[1]),
+                            "x2": int(xyxy[2]),
+                            "y2": int(xyxy[3])
                         },
-                        "is_dangerous":True
+
+                        "is_dangerous": True
                     })
-
-                    boxes.append(xyxy)
-
-            except Exception as e:
-                print(f"Custom YOLO error: {e}")
-
-        dets.sort(key=lambda x: x["confidence"], reverse=True)
-
-        print(f" → {len(dets)} objects: {[d['object'] for d in dets]}")
-
-        return dets
-
-    def _overlap(self, b, existing, thresh=0.3):
-
-        x1,y1,x2,y2 = b
-
-        for e in existing:
-
-            ex1,ey1,ex2,ey2 = e
-
-            ix1 = max(x1,ex1)
-            iy1 = max(y1,ey1)
-            ix2 = min(x2,ex2)
-            iy2 = min(y2,ey2)
-
-            if ix2<=ix1 or iy2<=iy1:
-                continue
-
-            inter = (ix2-ix1)*(iy2-iy1)
-            union = (x2-x1)*(y2-y1)+(ex2-ex1)*(ey2-ey1)-inter
-
-            if union>0 and inter/union>thresh:
-                return True
-
-        return False
-
-
-    def _predict_crime_type(self, cls, dets):
-
-        objects = [d["object"] for d in dets]
-        scene = cls.get("scene_type","unknown")
-
-        if "gun" in objects or "pistol" in objects or "rifle" in objects:
-            return "Armed Robbery"
-
-        if "knife" in objects and "person" in objects:
-            return "Assault with Weapon"
-
-        if objects.count("person") >= 2 and scene == "violence":
-            return "Physical Assault"
-
-        if "car" in objects or "truck" in objects or "motorcycle" in objects:
-            if scene == "violence":
-                return "Road Rage / Vehicle Assault"
-            return "Traffic Accident"
-
-        if "backpack" in objects and "person" not in objects:
-            return "Suspicious Object"
-
-        if "fire" in objects:
-            return "Arson / Fire Hazard"
-
-        if scene == "violence":
-            return "Violent Activity"
-
-        return "Normal Activity"
-
-
-    def _classify(self, pil):
-
-        if not self.classifier:
-            return {"scene_type":"unknown","confidence":0.0,"probabilities":{}}
-
-        try:
-            t = VAL_TF(pil).unsqueeze(0).to(self.device)
-
-            with torch.no_grad():
-                p = torch.softmax(self.classifier(t), dim=1)[0]
-
-            idx = p.argmax().item()
-
-            return {
-                "scene_type":CRIME_CLASSES[idx],
-                "confidence":round(float(p[idx]),3),
-                "probabilities":{c:round(float(p[i]),3) for i,c in enumerate(CRIME_CLASSES)}
-            }
 
         except Exception as e:
-            print(f"Classifier error: {e}")
-            return {"scene_type":"unknown","confidence":0.0,"probabilities":{}}
 
+            print("Detection error:", e)
 
-    def _describe(self, cls, dets):
+        return detections
 
-        scene,conf = cls.get("scene_type","unknown"), cls.get("confidence",0)
+    def _classify_scene(self, pil_image):
 
-        crime_type = self._predict_crime_type(cls, dets)
+        if not self.classifier:
+            return {"scene_type": "unknown", "confidence": 0}
 
-        lines = []
-        lines.append(f"🔎 Predicted Crime Type: {crime_type}")
+        try:
 
-        if scene=="violence":
-            lines.append(f"⚠️ VIOLENT scene classified with {conf*100:.1f}% confidence.")
-        elif scene=="normal":
-            lines.append(f"✅ NON-VIOLENT scene with {conf*100:.1f}% confidence.")
-        else:
-            lines.append("Scene classification inconclusive.")
+            tensor = VAL_TF(pil_image).unsqueeze(0).to(self.device)
 
-        counts = {}
+            with torch.no_grad():
 
-        for d in dets:
-            counts[d["object"]] = counts.get(d["object"],0)+1
+                probs = torch.softmax(
+                    self.classifier(tensor),
+                    dim=1
+                )[0]
 
-        if counts:
-            lines.append("Objects: " + ", ".join(f"{v}× {k}" for k,v in counts.items()) + ".")
+            idx = probs.argmax().item()
 
-        dangerous = list({d["object"] for d in dets if d.get("is_dangerous")})
+            return {
 
-        if dangerous:
-            lines.append(f"🚨 DANGEROUS items: {', '.join(dangerous)}.")
+                "scene_type": CRIME_CLASSES[idx],
 
-        persons = sum(1 for d in dets if d["object"]=="person")
+                "confidence": round(float(probs[idx]), 3)
+            }
 
-        if persons==1:
-            lines.append("1 individual visible.")
-        elif persons>1:
-            lines.append(f"{persons} individuals visible.")
+        except:
 
-        lines.append("Evidence logged for review.")
+            return {"scene_type": "unknown", "confidence": 0}
 
-        return " ".join(lines)
+    def _override_scene(self, classification, detections):
 
+        objects = [d["object"] for d in detections]
 
-    def _threat(self, cls, dets):
+        if any(o in ["gun", "knife", "weapon"] for o in objects):
+
+            classification["scene_type"] = "violence"
+
+            classification["confidence"] = max(
+                classification["confidence"],
+                0.9
+            )
+
+        return classification
+
+    def _calculate_threat(self, classification, detections):
 
         score = 0
 
-        if cls.get("scene_type")=="violence":
-            score += 40 * cls.get("confidence",0)
+        objects = [d["object"] for d in detections]
 
-        W = {"gun":35,"pistol":35,"rifle":35,"weapon":30,"knife":25,"blood":20,"fire":20}
+        if any(o in DANGEROUS_OBJECTS for o in objects):
+            score += 60
 
-        for d in dets:
-            score += W.get(d["object"],3)*d["confidence"]
+        if classification["scene_type"] == "violence":
+            score += 30
 
-        score = min(100, score)
+        score = min(score, 100)
 
-        if score>=70:
-            level,color="CRITICAL","red"
-        elif score>=40:
-            level,color="HIGH","orange"
-        elif score>=20:
-            level,color="MODERATE","yellow"
+        if score >= 70:
+            level = "CRITICAL"
+        elif score >= 40:
+            level = "HIGH"
+        elif score >= 20:
+            level = "MODERATE"
         else:
-            level,color="LOW","green"
+            level = "LOW"
 
-        return {"level":level,"score":round(score,1),"color":color}
+        return {"level": level, "score": score}
 
+    def _generate_description(self, classification, detections):
 
-    def _annotate(self, img_path:str, dets:list):
+        objects = [d["object"] for d in detections]
 
-        try:
-            img = cv2.imread(img_path)
+        if "gun" in objects:
+            crime = "Armed Robbery"
 
-            if img is None:
-                return img_path
+        elif "knife" in objects:
+            crime = "Assault with Weapon"
 
-            for d in dets:
+        elif classification["scene_type"] == "violence":
+            crime = "Violent Activity"
 
-                b = d["box"]
-                x1,y1,x2,y2 = b["x1"],b["y1"],b["x2"],b["y2"]
+        else:
+            crime = "Normal Activity"
 
-                color = COLORS.get(d["object"], DEF_COLOR)
+        counts = {}
 
-                label = f'{d["object"].upper()} {d["confidence"]*100:.0f}%'
+        for obj in objects:
+            counts[obj] = counts.get(obj, 0) + 1
 
-                cv2.rectangle(img,(x1,y1),(x2,y2),color,2)
+        obj_text = ", ".join(
+            f"{v}× {k}" for k, v in counts.items()
+        )
 
-                font,fs,ft = cv2.FONT_HERSHEY_SIMPLEX,0.52,1
+        return f"Predicted Crime Type: {crime}. Objects detected: {obj_text}. Evidence logged for review."
 
-                (tw,th),bl = cv2.getTextSize(label,font,fs,ft)
+    def _generate_police_report(self, description, threat, detections):
 
-                pad=4
+        case_id = str(uuid.uuid4())[:8]
 
-                lx1,ly1,lx2,ly2 = x1, max(0,y1-th-pad*2-bl), x1+tw+pad*2, y1
+        objects = [d["object"] for d in detections]
 
-                overlay = img.copy()
+        evidence = ", ".join(set(objects)) if objects else "No evidence"
 
-                cv2.rectangle(overlay,(lx1,ly1),(lx2,ly2),color,-1)
-
-                cv2.addWeighted(overlay,0.8,img,0.2,0,img)
-
-                cv2.putText(img,label,(lx1+pad,ly2-bl-2),font,fs,(255,255,255),ft,cv2.LINE_AA)
-
-            base,ext = os.path.splitext(img_path)
-
-            out = f"{base}_annotated{ext}"
-
-            cv2.imwrite(out,img)
-
-            return out
-
-        except Exception as e:
-            print(f"Annotation error: {e}")
-            return img_path   
-        
-# ───────────── FORENSIC REPORT GENERATOR ─────────────
-
-def _generate_report(self, cls, dets, threat):
-
-    crime_type = self._predict_crime_type(cls, dets)
-
-    objects = [d["object"] for d in dets]
-
-    evidence = ", ".join(set(objects)) if objects else "No visible evidence"
-
-    persons = objects.count("person")
-
-    if persons > 0:
-        people_text = f"{persons} individual(s) detected"
-    else:
-        people_text = "No persons detected"
-
-    recommendation = "Monitor situation"
-
-    if threat["level"] == "CRITICAL":
-        recommendation = "Immediate law enforcement response required."
-
-    elif threat["level"] == "HIGH":
-        recommendation = "Security intervention recommended."
-
-    elif threat["level"] == "MODERATE":
-        recommendation = "Situation should be monitored."
-
-    report = f"""
+        return f"""
 CRIME SCENE REPORT
 
-Possible Crime Type: {crime_type}
+Case ID: {case_id}
 
-Threat Level: {threat['level']} (Score: {threat['score']})
+Threat Level: {threat['level']} ({threat['score']}/100)
 
 Evidence Detected:
 {evidence}
 
-People Detected:
-{people_text}
+Description:
+{description}
 
 Recommended Action:
-{recommendation}
+Immediate law enforcement review recommended.
 
 AI Forensic System Analysis Complete.
-"""
+""".strip()
 
-    return report.strip()
+    def _annotate_image(self, image_path, detections):
 
+        img = cv2.imread(image_path)
 
-# ───────────── MODIFY analyze() FUNCTION ─────────────
+        if img is None:
+            return image_path
 
-def analyze(self, img_path:str, img_bytes:bytes, filename:str) -> dict:
+        for d in detections:
 
-    validation  = self.validate_image(img_bytes, filename)
-    pil         = Image.open(img_path).convert("RGB")
+            b = d["box"]
 
-    detections  = self._detect(img_path)
-    cls_result  = self._classify(pil)
+            x1,y1,x2,y2 = b["x1"],b["y1"],b["x2"],b["y2"]
 
-    description = self._describe(cls_result, detections)
+            color = (0,255,0)
 
-    threat      = self._threat(cls_result, detections)
+            if d["object"] in DANGEROUS_OBJECTS:
+                color = (0,0,255)
 
-    # NEW: Generate forensic report
-    report = self._generate_report(cls_result, detections, threat)
+            label = f"{d['object']} {int(d['confidence']*100)}%"
 
-    ann_path    = self._annotate(img_path, detections)
+            cv2.rectangle(img,(x1,y1),(x2,y2),color,2)
 
-    return {
-        "validation":validation,
-        "classification":cls_result,
-        "detections":detections,
-        "description":description,
-        "forensic_report": report,
-        "threat_level":threat,
-        "annotated_image":ann_path,
-        "total_objects":len(detections),
-        "dangerous_objects":[d for d in detections if d["object"] in DANGEROUS_OBJECTS],
-    }
+            cv2.putText(
+                img,
+                label,
+                (x1,y1-5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                2
+            )
+
+        base,ext = os.path.splitext(image_path)
+
+        output = f"{base}_annotated{ext}"
+
+        cv2.imwrite(output,img)
+
+        return output
+
+    def analyze(self, img_path, img_bytes, filename):
+
+        validation = self.validate_image(img_bytes, filename)
+
+        pil_image = Image.open(img_path).convert("RGB")
+
+        detections = self._detect_objects(img_path)
+
+        classification = self._classify_scene(pil_image)
+
+        classification = self._override_scene(
+            classification,
+            detections
+        )
+
+        description = self._generate_description(
+            classification,
+            detections
+        )
+
+        threat = self._calculate_threat(
+            classification,
+            detections
+        )
+
+        annotated = self._annotate_image(
+            img_path,
+            detections
+        )
+
+        report = self._generate_police_report(
+            description,
+            threat,
+            detections
+        )
+
+        return {
+
+            "validation": validation,
+
+            "classification": classification,
+
+            "detections": detections,
+
+            "description": description,
+
+            "forensic_report": report,
+
+            "threat_level": threat,
+
+            "annotated_image": annotated,
+
+            "dangerous_objects": [
+                d for d in detections
+                if d["object"] in DANGEROUS_OBJECTS
+            ]
+        }
