@@ -28,6 +28,7 @@ def home():
     return {"message": "CrimeSolver AI API is running"}
 
 @app.get("/health")
+@app.head("/health")
 def health():
     return {
         "status":       "running",
