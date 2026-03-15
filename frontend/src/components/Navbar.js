@@ -4,7 +4,7 @@ import { Shield, FolderOpen, Activity } from 'lucide-react';
 import axios from 'axios';
 import './Navbar.css';
 
-const API = 'http://localhost:8000';
+const API = 'https://crimesolver.onrender.com';
 
 export default function Navbar() {
   const location = useLocation();
