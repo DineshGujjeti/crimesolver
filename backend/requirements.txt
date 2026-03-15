@@ -1,9 +1,12 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 fastapi==0.111.0
 uvicorn[standard]==0.30.1
 python-multipart==0.0.9
 
-torch==2.6.0
-torchvision==0.21.0
+# Downgraded to 2.5.1 and forced CPU-only to fix YOLO and save 2GB of space
+torch==2.5.1+cpu
+torchvision==0.20.1+cpu
 
 ultralytics==8.2.0
 
