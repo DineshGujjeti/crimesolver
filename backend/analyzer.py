@@ -85,7 +85,7 @@ class CrimeAnalyzer:
 
                 checkpoint = torch.load(
                     classifier_path,
-                    map_location=self.device
+                    map_location=self.device,
                     weights_only=False
                 )
 
