@@ -4,7 +4,7 @@ import axios from 'axios';
 import { FolderOpen, AlertTriangle, Search, Trash2, ExternalLink, RefreshCw } from 'lucide-react';
 import './CasesPage.css';
 
-const API = 'http://localhost:8000';
+const API = 'https://crimesolver.onrender.com';
 
 export default function CasesPage() {
   const [cases,   setCases]   = useState([]);
