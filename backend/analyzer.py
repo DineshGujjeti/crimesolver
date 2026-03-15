@@ -1,4 +1,3 @@
-
 import cv2
 import torch
 import numpy as np
@@ -12,9 +11,6 @@ from PIL import Image
 from torchvision import transforms, models
 import torch.nn as nn
 from ultralytics import YOLO
-from ultralytics.nn.tasks import DetectionModel
-
-torch.serialization.add_safe_globals([DetectionModel])
 
 MODELS_DIR = os.path.join(os.path.dirname(__file__), "../models")
 
