@@ -4,7 +4,7 @@ import axios from 'axios';
 import { ArrowLeft, FileText, AlertTriangle, Target, Eye, Shield, Download } from 'lucide-react';
 import './CaseDetailPage.css';
 
-const API = 'http://localhost:8000';
+const API = 'https://crimesolver.onrender.com';
 
 export default function CaseDetailPage() {
   const { id } = useParams();
